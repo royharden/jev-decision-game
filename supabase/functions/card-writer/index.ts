@@ -188,8 +188,15 @@ Deno.serve(async (req: Request) => {
           action: String(c.action).slice(0, 500),
           context: String(c.context).slice(0, 1000),
           theme: THEMES.includes(c.theme) ? c.theme : theme ?? "money",
+          source: "llm" as const,
         }));
-      return new Response(JSON.stringify({ cards: valid, source: "llm" }), {
+      // Insert with the service role (bypasses RLS) and return the saved rows.
+      const { data: saved, error: insertErr } = await supabase
+        .from("cards")
+        .insert(valid)
+        .select("*");
+      if (insertErr) throw new Error(insertErr.message);
+      return new Response(JSON.stringify({ cards: saved ?? [], source: "llm" }), {
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }

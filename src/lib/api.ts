@@ -139,7 +139,7 @@ export async function fetchRevealExtras(
 }
 
 export interface GenerateResult {
-  cards: Array<{ agent_role: string; action: string; context: string; theme: string }>;
+  cards: CardRow[];
   source: "llm" | "mock";
 }
 
@@ -152,19 +152,6 @@ export async function generateCards(theme: string | undefined, count: number, mo
   });
   if (!out?.cards?.length) throw new Error("No cards came back from the writer");
   return out;
-}
-
-export async function insertGeneratedCards(cards: GenerateResult["cards"]): Promise<CardRow[]> {
-  const rows = cards.map((c) => ({
-    agent_role: c.agent_role,
-    action: c.action,
-    context: c.context,
-    theme: c.theme,
-    source: "llm" as const,
-  }));
-  const { data, error } = await supabase.from("cards").insert(rows).select("*");
-  if (error) throw new Error(error.message);
-  return (data ?? []) as CardRow[];
 }
 
 export interface SubmitCardInput {

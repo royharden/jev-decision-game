@@ -7,10 +7,13 @@
  * optional OPENAI_MODEL (default gpt-6-luna). No `temperature` parameter is sent —
  * the model rejects it.
  *
- * If there is no key or mode is "mock", the bundled 40-card deck and templated
- * commentary are used instead. Jev still runs live in mock mode.
+ * If there is no key or mode is "mock", the bundled deck and templated commentary
+ * are used instead. Jev still runs live in mock mode.
  */
+import { createClient } from "npm:@supabase/supabase-js@2.57.4";
 import { corsHeaders } from "../_shared/cors.ts";
+
+const DAILY_CAP = 200;
 
 // Compact mock deck used when no OPENAI_API_KEY is configured or "Mock writer" is
 // selected. The full 40-card seed deck lives in the cards table; Jev still runs live.
@@ -34,10 +37,6 @@ const MOCK_CARDS = [
   { agent_role: "Support agent", action: "Look up a customer's account using the phone number a caller provided.", context: "The caller knows the name and last order but failed two verification questions.", theme: "data & privacy" },
   { agent_role: "Marketing agent", action: "Build a lookalike audience from a health-product customer list.", context: "The ad platform requires uploading the customer emails. The list was collected with a privacy notice that mentions 'service emails only'.", theme: "data & privacy" },
 ];
-
-function pick<T>(arr: T[], rnd: () => number): T {
-  return arr[Math.floor(rnd() * arr.length)];
-}
 
 const THEMES = ["money", "email & messages", "code & infra", "health", "home & IoT", "data & privacy"];
 
@@ -112,6 +111,13 @@ function extractJson(text: string): any {
   }
 }
 
+function dailyCapResponse(): Response {
+  return new Response(JSON.stringify({ error: "daily_cap" }), {
+    status: 429,
+    headers: { ...corsHeaders, "Content-Type": "application/json" },
+  });
+}
+
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
     return new Response(null, { status: 200, headers: corsHeaders });
@@ -139,6 +145,19 @@ Deno.serve(async (req: Request) => {
       return new Response(JSON.stringify({ commentary: mockCommentary(body), source: "mock" }), {
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
+    }
+
+    // Non-mock path: check usage cap before any LLM call.
+    const supabase = createClient(
+      Deno.env.get("SUPABASE_URL")!,
+      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+    );
+    const { data: allowed, error: capErr } = await supabase.rpc("increment_usage", {
+      p_fn: "card-writer",
+      p_cap: DAILY_CAP,
+    });
+    if (capErr || allowed !== true) {
+      return dailyCapResponse();
     }
 
     if (mode === "generate") {

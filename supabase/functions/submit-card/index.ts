@@ -10,8 +10,9 @@ import { corsHeaders } from "../_shared/cors.ts";
 const MODEL = "jev-1.13.0";
 const INPUT_COST_PER_TOKEN = 0.042 / 1_000_000;
 const THEMES = ["money", "email & messages", "code & infra", "health", "home & IoT", "data & privacy"];
+const DAILY_CAP = 200;
 
-async function callJev(payload: unknown, apiKey: string, _unused?: unknown, attempt = 0): Promise<any> {
+async function callJev(payload: unknown, apiKey: string, attempt = 0): Promise<any> {
   const res = await fetch("https://api.typesafe.ai/v1/systemone", {
     method: "POST",
     headers: {
@@ -22,13 +23,20 @@ async function callJev(payload: unknown, apiKey: string, _unused?: unknown, atte
   });
   if ((res.status === 429 || res.status === 529) && attempt < 2) {
     await new Promise((r) => setTimeout(r, 500 * Math.pow(2, attempt + 1)));
-    return callJev(payload, apiKey, _unused, attempt + 1);
+    return callJev(payload, apiKey, attempt + 1);
   }
   if (!res.ok) {
     const detail = await res.text().catch(() => "");
     throw new Error(`Jev API failed (${res.status}): ${detail.slice(0, 300)}`);
   }
   return res.json();
+}
+
+function dailyCapResponse(): Response {
+  return new Response(JSON.stringify({ error: "daily_cap" }), {
+    status: 429,
+    headers: { ...corsHeaders, "Content-Type": "application/json" },
+  });
 }
 
 Deno.serve(async (req: Request) => {
@@ -54,12 +62,25 @@ Deno.serve(async (req: Request) => {
     const action = String(body.action ?? "").trim().slice(0, 600);
     const context = String(body.context ?? "").trim().slice(0, 1200);
     const theme = THEMES.includes(body.theme) ? body.theme : "money";
-    const nickname = String(body.nickname ?? "player").slice(0, 40);
     if (!agent_role || !action || !context) {
       return new Response(
         JSON.stringify({ error: "agent_role, action and context are required" }),
         { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
+    }
+
+    const supabase = createClient(
+      Deno.env.get("SUPABASE_URL")!,
+      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+    );
+
+    // Usage cap check — right before the first Jev API call.
+    const { data: allowed1, error: capErr1 } = await supabase.rpc("increment_usage", {
+      p_fn: "submit-card",
+      p_cap: DAILY_CAP,
+    });
+    if (capErr1 || allowed1 !== true) {
+      return dailyCapResponse();
     }
 
     // Gate 1: safety + relevance noul, one request.
@@ -104,6 +125,15 @@ Deno.serve(async (req: Request) => {
         }),
         { headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
+    }
+
+    // Usage cap check — right before the second Jev API call (full judgment).
+    const { data: allowed2, error: capErr2 } = await supabase.rpc("increment_usage", {
+      p_fn: "submit-card",
+      p_cap: DAILY_CAP,
+    });
+    if (capErr2 || allowed2 !== true) {
+      return dailyCapResponse();
     }
 
     // Gate 2: full judgment, one request, cached on the card row.
@@ -159,10 +189,6 @@ Deno.serve(async (req: Request) => {
     const usage = judged?.usage ?? {};
     const costUsd = gateCost + (usage.input_tokens ?? 0) * INPUT_COST_PER_TOKEN;
 
-    const supabase = createClient(
-      Deno.env.get("SUPABASE_URL")!,
-      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
-    );
     const { data: inserted, error } = await supabase
       .from("cards")
       .insert({

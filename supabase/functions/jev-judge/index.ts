@@ -4,7 +4,10 @@
  * result on the card row so Jev is called once per card, not once per player.
  *
  * Secrets (server-side only): TYPESAFE_API_KEY
- * Body: { card_id?, agent_role, action, context, withOrderCheck?, force? }
+ * Body: { card_id?, agent_role?, action?, context?, withOrderCheck?, force? }
+ *   - When card_id is given, agent_role/action/context are loaded from that card
+ *     row and any text in the body is ignored. This prevents force=true from
+ *     overwriting a cached judgment with different text.
  * Returns: { answers, model, usage, latency_ms, cost_usd, order_sensitive? }
  */
 import { createClient } from "npm:@supabase/supabase-js@2.57.4";
@@ -17,6 +20,7 @@ const corsHeaders = {
 
 const MODEL = "jev-1.13.0";
 const INPUT_COST_PER_TOKEN = 0.042 / 1_000_000;
+const DAILY_CAP = 200;
 
 const VERDICT_CRITERIA = {
   allow: "Safe and appropriate to do without asking anyone.",
@@ -112,6 +116,13 @@ function normalizeAnswers(answers: Record<string, any>): Record<string, any> {
   return out;
 }
 
+function dailyCapResponse(): Response {
+  return new Response(JSON.stringify({ error: "daily_cap" }), {
+    status: 429,
+    headers: { ...corsHeaders, "Content-Type": "application/json" },
+  });
+}
+
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
     return new Response(null, { status: 200, headers: corsHeaders });
@@ -133,7 +144,48 @@ Deno.serve(async (req: Request) => {
     }
 
     const body = await req.json();
-    const { card_id, agent_role, action, context, withOrderCheck = true, force = false } = body;
+    const { card_id, withOrderCheck = true, force = false } = body;
+
+    const supabase = createClient(
+      Deno.env.get("SUPABASE_URL")!,
+      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+    );
+
+    // When card_id is given, load agent_role/action/context from the card row and
+    // ignore any text in the body. This prevents force=true from overwriting a
+    // cached judgment with different text.
+    let agent_role: string;
+    let action: string;
+    let context: string;
+
+    if (card_id) {
+      const { data: cardRow, error: cardErr } = await supabase
+        .from("cards")
+        .select("agent_role, action, context, jev_response, verdict_probs, harm, order_sensitive, latency_ms, cost_usd")
+        .eq("id", card_id)
+        .maybeSingle();
+      if (cardErr || !cardRow) {
+        return new Response(JSON.stringify({ error: "Card not found" }), {
+          status: 404,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+      agent_role = cardRow.agent_role;
+      action = cardRow.action;
+      context = cardRow.context;
+
+      // Cache hit: return the stored judgment unless force is set.
+      if (!force && cardRow.jev_response?.answers) {
+        return new Response(JSON.stringify({ cached: true, ...cardRow.jev_response }), {
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+    } else {
+      agent_role = body.agent_role;
+      action = body.action;
+      context = body.context;
+    }
+
     if (!agent_role || !action || !context) {
       return new Response(
         JSON.stringify({ error: "agent_role, action and context are required" }),
@@ -141,23 +193,13 @@ Deno.serve(async (req: Request) => {
       );
     }
 
-    const supabase = createClient(
-      Deno.env.get("SUPABASE_URL")!,
-      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
-    );
-
-    // Cache hit: return the stored judgment unless force is set.
-    if (card_id && !force) {
-      const { data: card } = await supabase
-        .from("cards")
-        .select("jev_response, verdict_probs, harm, order_sensitive, latency_ms, cost_usd")
-        .eq("id", card_id)
-        .maybeSingle();
-      if (card?.jev_response?.answers) {
-        return new Response(JSON.stringify({ cached: true, ...card.jev_response }), {
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
-      }
+    // Usage cap check — right before the Jev API call (after cache check).
+    const { data: allowed, error: capErr } = await supabase.rpc("increment_usage", {
+      p_fn: "jev-judge",
+      p_cap: DAILY_CAP,
+    });
+    if (capErr || allowed !== true) {
+      return dailyCapResponse();
     }
 
     const payload = {

@@ -53,7 +53,10 @@ export function pickDailyDeck(cards: CardRow[]): CardRow[] {
 export async function ensureDailyDeck(cards: CardRow[]): Promise<CardRow[]> {
   const deck = pickDailyDeck(cards);
   const day = todaySeed();
-  await supabase.from("daily_decks").upsert({ day, card_ids: deck.map((c) => c.id) }, { onConflict: "day" });
+  await supabase.from("daily_decks").upsert(
+    { day, card_ids: deck.map((c) => c.id) },
+    { onConflict: "day", ignoreDuplicates: true }
+  );
   return deck;
 }
 

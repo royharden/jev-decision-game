@@ -1,0 +1,10 @@
+project_id = "jev-decision-game"
+
+[functions.jev-judge]
+verify_jwt = false
+
+[functions.card-writer]
+verify_jwt = false
+
+[functions.submit-card]
+verify_jwt = false

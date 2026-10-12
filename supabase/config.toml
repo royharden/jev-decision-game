@@ -8,3 +8,9 @@ verify_jwt = true
 
 [functions.submit-card]
 verify_jwt = true
+
+[functions.submit-vote]
+verify_jwt = true
+
+[functions.daily-deck]
+verify_jwt = true

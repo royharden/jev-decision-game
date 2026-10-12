@@ -8,7 +8,6 @@ import {
   type VoteRow,
 } from "./types";
 import { getPlayerId, getNickname } from "./player";
-import { scoreAnswer, todaySeed, seededShuffle } from "./scoring";
 
 export interface CrowdSplit {
   counts: Record<Option, number>;
@@ -46,18 +45,14 @@ export async function fetchPlayerCards(): Promise<CardRow[]> {
   return (data ?? []) as CardRow[];
 }
 
-export function pickDailyDeck(cards: CardRow[]): CardRow[] {
-  return seededShuffle(cards, todaySeed()).slice(0, 10);
-}
-
-export async function ensureDailyDeck(cards: CardRow[]): Promise<CardRow[]> {
-  const deck = pickDailyDeck(cards);
-  const day = todaySeed();
-  await supabase.from("daily_decks").upsert(
-    { day, card_ids: deck.map((c) => c.id) },
-    { onConflict: "day", ignoreDuplicates: true }
-  );
-  return deck;
+/** Today's deck. The daily-deck edge function picks and stores it on the first request of the day. */
+export async function fetchDailyDeck(): Promise<CardRow[]> {
+  const { card_ids } = await callFunction<{ day: string; card_ids: string[] }>("daily-deck", {});
+  if (!card_ids?.length) return [];
+  const { data, error } = await supabase.from("cards").select("*").in("id", card_ids);
+  if (error) throw new Error(error.message);
+  const byId = new Map(((data ?? []) as CardRow[]).map((c) => [c.id, c]));
+  return card_ids.map((id) => byId.get(id)).filter((c): c is CardRow => !!c);
 }
 
 export async function fetchCrowd(cardId: string): Promise<CrowdSplit> {
@@ -95,22 +90,20 @@ export interface SubmitVoteInput {
   card: CardRow;
   pick: Option;
   confidence: number;
-  points: number;
   mode: string;
   seconds: number | null;
 }
 
-export async function submitVote({ card, pick, confidence, points, mode }: SubmitVoteInput): Promise<void> {
-  const { error } = await supabase.from("votes").insert({
+/** Votes go through the submit-vote edge function, which scores them; returns the stored points. */
+export async function submitVote({ card, pick, confidence, mode }: SubmitVoteInput): Promise<{ points: number }> {
+  return callFunction<{ points: number }>("submit-vote", {
     card_id: card.id,
     player_id: getPlayerId(),
     nickname: getNickname(),
     pick,
     confidence,
-    points,
     mode,
   });
-  if (error) throw new Error(error.message);
 }
 
 export interface RevealData {

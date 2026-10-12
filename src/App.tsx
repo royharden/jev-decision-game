@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { Home, BarChart3, Trophy, Sparkles } from "lucide-react";
-import { fetchAllCards, fetchCardsByTheme, ensureDailyDeck } from "@/lib/api";
+import { fetchAllCards, fetchCardsByTheme, fetchDailyDeck } from "@/lib/api";
 import type { CardResult, CardRow } from "@/lib/types";
 import HomeView from "@/views/Home";
 import Game from "@/views/Game";
@@ -34,11 +34,11 @@ export default function App() {
   }, []);
 
   const startDaily = useCallback(async () => {
-    const deck = allCards.length ? await ensureDailyDeck(allCards) : [];
+    const deck = await fetchDailyDeck().catch(() => []);
     if (deck.length) {
       setScreen({ name: "game", cards: deck, mode: "daily", label: "Daily deck" });
     }
-  }, [allCards]);
+  }, []);
 
   const startEndless = useCallback(
     async (theme?: string) => {

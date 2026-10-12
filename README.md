@@ -46,7 +46,8 @@ genuinely sit between "allow" and "ask a human."
 
 ## Game modes
 
-- **Daily deck** — the same 10 cards for everyone each day (seeded by date), with a
+- **Daily deck** — the same 10 cards for everyone each day (picked at random by the
+  `daily-deck` edge function on the first request of the UTC day), with a
   shareable emoji-square result grid.
 - **Endless** — random cards, filterable by theme.
 - **Agree with the crowd?** — predict the crowd's majority instead of Jev's verdict.
@@ -59,12 +60,15 @@ genuinely sit between "allow" and "ask a human."
 Vite + React + TypeScript + Tailwind, Supabase (Postgres + Edge Functions), lucide-react,
 recharts, framer-motion. No auth: players pick a nickname stored in localStorage with a
 random `player_id`.
+The browser only reads tables with the anon key; cards, votes and daily decks are
+written by edge functions running with the service role (`submit-card`, `card-writer`,
+`submit-vote`, `daily-deck`).
 
 ## Setup
 
 ```bash
 supabase secrets set TYPESAFE_API_KEY=... OPENAI_API_KEY=...
-supabase functions deploy jev-judge card-writer submit-card
+supabase functions deploy jev-judge card-writer submit-card submit-vote daily-deck
 npm install
 npm run dev
 ```
@@ -77,7 +81,8 @@ npm run dev
 | `OPENAI_API_KEY` | `card-writer` | Card generation and commentary. Without it, the bundled mock deck is used; Jev still runs live |
 | `OPENAI_BASE_URL` (optional) | `card-writer` | Defaults to `https://api.openai.com/v1` |
 | `OPENAI_MODEL` (optional) | `card-writer` | Defaults to `gpt-6-luna` (no `temperature` parameter is sent) |
-| `DAILY_CALL_LIMIT` (optional) | all three | Upstream requests allowed per function per UTC day (default `200`). Every Jev/LLM request, retries included, is counted first; over the cap the function returns `429 {"error":"daily_limit"}` |
+| `DAILY_CALL_LIMIT` (optional) | `jev-judge`, `card-writer`, `submit-card` | Upstream requests allowed per function per UTC day (default `200`). Every Jev/LLM request, retries included, is counted first; over the cap the function returns `429 {"error":"daily_limit"}` |
+| `VOTE_DAILY_LIMIT` (optional) | `submit-vote` | Votes allowed per `player_id` per UTC day (default `300`); over the cap the function returns `429` |
 | `ADMIN_TOKEN` (optional, 16+ chars) | `jev-judge` | Required as the `x-admin-token` header for `force: true` (re-judge a cached card). Unset means force is disabled |
 
 Client env (pre-populated by the platform): `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY`.

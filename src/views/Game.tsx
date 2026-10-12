@@ -169,7 +169,8 @@ export default function Game({ cards, mode, onFinished, onExit }: Props) {
           .sort((a, b) => b[1] - a[1])[0][0];
         const prevStreak = results.length ? results[results.length - 1].streakAfter : 0;
         const streakAfter = jevTop === o ? prevStreak + 1 : 0;
-        await submitVote({ card, pick: o, confidence, points: scored.points, mode, seconds });
+        // Points come back from submit-vote, which scores the vote server-side.
+        const { points } = await submitVote({ card, pick: o, confidence, mode, seconds });
         setCrowd(crowdSplit);
         fetchRevealExtras(card, crowdSplit, usedProbs).then((r) => setCommentary(r.commentary));
         setPhase("reveal");
@@ -178,7 +179,7 @@ export default function Game({ cards, mode, onFinished, onExit }: Props) {
           {
             card,
             answer: { pick: o, confidence, seconds },
-            points: scored.points,
+            points,
             brier: scored.brier,
             jevBrier: scored.jevBrier,
             crowdBrier: scored.crowdBrier,

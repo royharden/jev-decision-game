@@ -77,6 +77,8 @@ npm run dev
 | `OPENAI_API_KEY` | `card-writer` | Card generation and commentary. Without it, the bundled mock deck is used; Jev still runs live |
 | `OPENAI_BASE_URL` (optional) | `card-writer` | Defaults to `https://api.openai.com/v1` |
 | `OPENAI_MODEL` (optional) | `card-writer` | Defaults to `gpt-6-luna` (no `temperature` parameter is sent) |
+| `DAILY_CALL_LIMIT` (optional) | all three | Upstream requests allowed per function per UTC day (default `200`). Every Jev/LLM request, retries included, is counted first; over the cap the function returns `429 {"error":"daily_limit"}` |
+| `ADMIN_TOKEN` (optional, 16+ chars) | `jev-judge` | Required as the `x-admin-token` header for `force: true` (re-judge a cached card). Unset means force is disabled |
 
 Client env (pre-populated by the platform): `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY`.
 
@@ -102,5 +104,5 @@ Client env (pre-populated by the platform): `VITE_SUPABASE_URL`, `VITE_SUPABASE_
 - **The LLM never explains Jev's reasoning.** The writer's commentary prompt may cite
   only the numbers it is handed (Jev's probabilities, harm, crowd split); it cannot
   speculate about why Jev chose what it chose. Cost is computed as
-  `input_tokens × $0.042 / 1M` (output tokens free); 429/529 responses are retried with
-  exponential backoff.
+  `input_tokens × $0.042 / 1M` (output tokens free); a Jev 429/529 or network error is
+  retried once with backoff, and the retry counts against the daily cap too.

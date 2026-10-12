@@ -3,40 +3,41 @@
  * two nouls: is_agent_action and unsafe_content. Accepts only if
  * is_agent_action >= 0.7 and unsafe_content < 0.2 (thresholds in code), then judges
  * the card with the same question set as jev-judge.
+ *
+ * Body (max 16 KB): { agent_role, action, context, theme }, trimmed to 300/600/1200
+ * chars. Every Jev request (both stages and any retry) counts against the daily cap.
  */
-import { createClient } from "npm:@supabase/supabase-js@2.57.4";
+import type { SupabaseClient } from "npm:@supabase/supabase-js@2.57.4";
 import { corsHeaders } from "../_shared/cors.ts";
+import { json, readJsonBody, text } from "../_shared/http.ts";
+import { countedFetch, errorResponse, notConfigured, serviceClient, upstreamFailure } from "../_shared/usage.ts";
 
+const FN = "submit-card";
+const JEV_URL = "https://api.typesafe.ai/v1/systemone";
 const MODEL = "jev-1.13.0";
 const INPUT_COST_PER_TOKEN = 0.042 / 1_000_000;
 const THEMES = ["money", "email & messages", "code & infra", "health", "home & IoT", "data & privacy"];
-const DAILY_CAP = 200;
 
-async function callJev(payload: unknown, apiKey: string, attempt = 0): Promise<any> {
-  const res = await fetch("https://api.typesafe.ai/v1/systemone", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
+// Each attempt (the first request and its one retry on 429/529/network error) is
+// counted against the daily cap right before it is sent; once the cap is reached
+// this throws and nothing further is sent.
+async function callJev(supabase: SupabaseClient, payload: unknown, apiKey: string): Promise<any> {
+  const res = await countedFetch(
+    supabase,
+    FN,
+    JEV_URL,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
     },
-    body: JSON.stringify(payload),
-  });
-  if ((res.status === 429 || res.status === 529) && attempt < 2) {
-    await new Promise((r) => setTimeout(r, 500 * Math.pow(2, attempt + 1)));
-    return callJev(payload, apiKey, attempt + 1);
-  }
-  if (!res.ok) {
-    const detail = await res.text().catch(() => "");
-    throw new Error(`Jev API failed (${res.status}): ${detail.slice(0, 300)}`);
-  }
+    { label: "Jev API", maxAttempts: 2, timeoutMs: 30_000 },
+  );
+  if (!res.ok) throw await upstreamFailure(FN, "Jev API", res);
   return res.json();
-}
-
-function dailyCapResponse(): Response {
-  return new Response(JSON.stringify({ error: "daily_cap" }), {
-    status: 429,
-    headers: { ...corsHeaders, "Content-Type": "application/json" },
-  });
 }
 
 Deno.serve(async (req: Request) => {
@@ -44,47 +45,27 @@ Deno.serve(async (req: Request) => {
     return new Response(null, { status: 200, headers: corsHeaders });
   }
   try {
-    if (req.method !== "POST") {
-      return new Response(JSON.stringify({ error: "POST required" }), {
-        status: 405,
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
-    }
-    const apiKey = Deno.env.get("TYPESAFE_API_KEY");
-    if (!apiKey) {
-      return new Response(JSON.stringify({ error: "TYPESAFE_API_KEY not configured" }), {
-        status: 500,
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
-    }
-    const body = await req.json();
-    const agent_role = String(body.agent_role ?? "").trim().slice(0, 300);
-    const action = String(body.action ?? "").trim().slice(0, 600);
-    const context = String(body.context ?? "").trim().slice(0, 1200);
-    const theme = THEMES.includes(body.theme) ? body.theme : "money";
+    if (req.method !== "POST") return json({ error: "POST required" }, 405);
+
+    const read = await readJsonBody(req);
+    if ("error" in read) return read.error;
+    const body = read.body;
+    const agent_role = text(body.agent_role, 300);
+    const action = text(body.action, 600);
+    const context = text(body.context, 1200);
+    const theme = typeof body.theme === "string" && THEMES.includes(body.theme) ? body.theme : "money";
     if (!agent_role || !action || !context) {
-      return new Response(
-        JSON.stringify({ error: "agent_role, action and context are required" }),
-        { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-      );
+      return json({ error: "agent_role, action and context are required" }, 400);
     }
 
-    const supabase = createClient(
-      Deno.env.get("SUPABASE_URL")!,
-      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
-    );
-
-    // Usage cap check — right before the first Jev API call.
-    const { data: allowed1, error: capErr1 } = await supabase.rpc("increment_usage", {
-      p_fn: "submit-card",
-      p_cap: DAILY_CAP,
-    });
-    if (capErr1 || allowed1 !== true) {
-      return dailyCapResponse();
-    }
+    const apiKey = Deno.env.get("TYPESAFE_API_KEY");
+    if (!apiKey) return notConfigured("TYPESAFE_API_KEY");
+    const supabase = serviceClient();
+    if (!supabase) return notConfigured("SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY");
 
     // Gate 1: safety + relevance noul, one request.
     const gate = await callJev(
+      supabase,
       {
         model: MODEL,
         state: { agent_role, action, context },
@@ -127,17 +108,9 @@ Deno.serve(async (req: Request) => {
       );
     }
 
-    // Usage cap check — right before the second Jev API call (full judgment).
-    const { data: allowed2, error: capErr2 } = await supabase.rpc("increment_usage", {
-      p_fn: "submit-card",
-      p_cap: DAILY_CAP,
-    });
-    if (capErr2 || allowed2 !== true) {
-      return dailyCapResponse();
-    }
-
     // Gate 2: full judgment, one request, cached on the card row.
     const judged = await callJev(
+      supabase,
       {
         model: MODEL,
         state: { agent_role, action, context },
@@ -206,15 +179,10 @@ Deno.serve(async (req: Request) => {
       })
       .select("id, agent_role, action, context, theme")
       .single();
-    if (error) throw new Error(error.message);
+    if (error) throw new Error(`card insert failed: ${error.message}`);
 
-    return new Response(JSON.stringify({ accepted: true, card: inserted }), {
-      headers: { ...corsHeaders, "Content-Type": "application/json" },
-    });
+    return json({ accepted: true, card: inserted });
   } catch (err) {
-    return new Response(JSON.stringify({ error: err?.message ?? "Internal error" }), {
-      status: 500,
-      headers: { ...corsHeaders, "Content-Type": "application/json" },
-    });
+    return errorResponse(FN, err);
   }
 });

@@ -4,16 +4,31 @@
  *  - commentary: 2 sentences on the tradeoff, citing ONLY the supplied numbers
  *
  * Secrets: OPENAI_API_KEY, optional OPENAI_BASE_URL (default https://api.openai.com/v1),
- * optional OPENAI_MODEL (default gpt-6-luna). No `temperature` parameter is sent —
- * the model rejects it.
+ * optional OPENAI_MODEL (default gpt-6-luna), optional DAILY_CALL_LIMIT (default 200
+ * LLM requests/day). These come only from env, never from the request. No
+ * `temperature` parameter is sent — the model rejects it.
+ *
+ * Body (max 16 KB). generate: theme must be one of THEMES (or omitted), count is
+ * clamped to 1..10. commentary: action/context are trimmed to 600/1200 chars,
+ * verdict_probs/crowd keep at most 10 numeric entries with keys up to 40 chars, and
+ * harm is passed on as a short string.
  *
  * If there is no key or mode is "mock", the bundled deck and templated commentary
  * are used instead. Jev still runs live in mock mode.
  */
-import { createClient } from "npm:@supabase/supabase-js@2.57.4";
+import type { SupabaseClient } from "npm:@supabase/supabase-js@2.57.4";
 import { corsHeaders } from "../_shared/cors.ts";
+import { json, readJsonBody, text } from "../_shared/http.ts";
+import {
+  countedFetch,
+  errorResponse,
+  notConfigured,
+  serviceClient,
+  upstreamFailure,
+  UpstreamError,
+} from "../_shared/usage.ts";
 
-const DAILY_CAP = 200;
+const FN = "card-writer";
 
 // Compact mock deck used when no OPENAI_API_KEY is configured or "Mock writer" is
 // selected. The full 40-card seed deck lives in the cards table; Jev still runs live.
@@ -64,34 +79,65 @@ function mockGenerate(theme: string | undefined, count: number, rnd: () => numbe
   return out;
 }
 
-function mockCommentary(body: any): string {
-  const probs = body.verdict_probs ?? {};
-  const top = Object.entries(probs).sort((a: any, b: any) => b[1] - a[1])[0];
-  const crowdTop = Object.entries(body.crowd ?? {}).sort((a: any, b: any) => b[1] - a[1])[0];
+interface CommentaryInput {
+  action: string;
+  context: string;
+  verdict_probs: Record<string, number>;
+  harm: string | null;
+  crowd: Record<string, number>;
+}
+
+/** At most 10 finite numeric entries with 1-40 char keys; anything else is dropped. */
+function numericMap(value: unknown): Record<string, number> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const entries = Object.entries(value)
+    .filter(([k, v]) => k.length > 0 && k.length <= 40 && typeof v === "number" && Number.isFinite(v))
+    .slice(0, 10);
+  return Object.fromEntries(entries) as Record<string, number>;
+}
+
+function shortHarm(value: unknown): string | null {
+  if (typeof value === "number" && Number.isFinite(value)) return String(value).slice(0, 16);
+  if (typeof value === "string") return value.trim().slice(0, 16) || null;
+  return null;
+}
+
+function mockCommentary(input: CommentaryInput): string {
+  const probs = input.verdict_probs;
+  const top = Object.entries(probs).sort((a, b) => b[1] - a[1])[0];
+  const crowdTop = Object.entries(input.crowd).sort((a, b) => b[1] - a[1])[0];
   const pct = (n: number) => `${Math.round(n * 100)}%`;
   if (!top) return "The tradeoff here is between moving fast and keeping a human in the loop.";
   if (crowdTop && crowdTop[0] !== top[0]) {
-    return `Jev puts ${Math.round(top[1] * 100)}% on ${top[0]}, but the crowd leans ${crowdTop[0]} at ${pct(crowdTop[1] as number)}. When they disagree, the interesting question is whether the crowd sees context Jev is missing.`;
+    return `Jev puts ${Math.round(top[1] * 100)}% on ${top[0]}, but the crowd leans ${crowdTop[0]} at ${pct(crowdTop[1])}. When they disagree, the interesting question is whether the crowd sees context Jev is missing.`;
   }
-  return `Both Jev (${pct(top[1] as number)} on ${top[0]}) and the crowd${crowdTop ? ` (${pct(crowdTop[1] as number)} on ${crowdTop[0]})` : ""} land in the same place. That agreement is a signal the call is not a close one.`;
+  return `Both Jev (${pct(top[1])} on ${top[0]}) and the crowd${crowdTop ? ` (${pct(crowdTop[1])} on ${crowdTop[0]})` : ""} land in the same place. That agreement is a signal the call is not a close one.`;
 }
 
-async function callLLM(messages: { role: string; content: string }[]): Promise<string> {
-  const apiKey = Deno.env.get("OPENAI_API_KEY");
+// One LLM request per invocation, counted against the daily cap right before it is
+// sent. There is no retry, and the JSON parse fallback in extractJson is local only.
+async function callLLM(
+  supabase: SupabaseClient,
+  apiKey: string,
+  messages: { role: string; content: string }[],
+): Promise<string> {
   const baseUrl = Deno.env.get("OPENAI_BASE_URL") ?? "https://api.openai.com/v1";
   const model = Deno.env.get("OPENAI_MODEL") ?? "gpt-6-luna";
-  const res = await fetch(`${baseUrl}/chat/completions`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
+  const res = await countedFetch(
+    supabase,
+    FN,
+    `${baseUrl}/chat/completions`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ model, messages }),
     },
-    body: JSON.stringify({ model, messages }),
-  });
-  if (!res.ok) {
-    const detail = await res.text().catch(() => "");
-    throw new Error(`LLM request failed (${res.status}): ${detail.slice(0, 300)}`);
-  }
+    { label: "LLM request", maxAttempts: 1, timeoutMs: 120_000 },
+  );
+  if (!res.ok) throw await upstreamFailure(FN, "LLM request", res);
   const data = await res.json();
   return data?.choices?.[0]?.message?.content ?? "";
 }
@@ -100,22 +146,19 @@ function extractJson(text: string): any {
   const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
   const raw = fenced ? fenced[1] : text;
   const start = raw.search(/[[{]/);
-  if (start === -1) throw new Error("No JSON found in LLM output");
+  if (start === -1) throw new UpstreamError("LLM output had no JSON");
   const slice = raw.slice(start);
   try {
     return JSON.parse(slice);
   } catch {
     // try trimming to the last closing bracket
     const last = Math.max(slice.lastIndexOf("]"), slice.lastIndexOf("}"));
-    return JSON.parse(slice.slice(0, last + 1));
+    try {
+      return JSON.parse(slice.slice(0, last + 1));
+    } catch {
+      throw new UpstreamError("LLM output was not valid JSON");
+    }
   }
-}
-
-function dailyCapResponse(): Response {
-  return new Response(JSON.stringify({ error: "daily_cap" }), {
-    status: 429,
-    headers: { ...corsHeaders, "Content-Type": "application/json" },
-  });
 }
 
 Deno.serve(async (req: Request) => {
@@ -123,47 +166,49 @@ Deno.serve(async (req: Request) => {
     return new Response(null, { status: 200, headers: corsHeaders });
   }
   try {
-    if (req.method !== "POST") {
-      return new Response(JSON.stringify({ error: "POST required" }), {
-        status: 405,
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
-    }
-    const body = await req.json();
+    if (req.method !== "POST") return json({ error: "POST required" }, 405);
+
+    const read = await readJsonBody(req);
+    if ("error" in read) return read.error;
+    const body = read.body;
     const mode: "generate" | "commentary" = body.mode === "commentary" ? "commentary" : "generate";
     const useMock = body.mock === true;
     const apiKey = Deno.env.get("OPENAI_API_KEY");
 
+    // Validate and bound everything before any prompt is built (mock or LLM).
+    let theme: string | undefined;
+    let count = 5;
+    if (mode === "generate") {
+      if (body.theme !== undefined && body.theme !== null && body.theme !== "") {
+        if (typeof body.theme !== "string" || !THEMES.includes(body.theme)) {
+          return json({ error: `theme must be one of: ${THEMES.join(", ")}` }, 400);
+        }
+        theme = body.theme;
+      }
+      const n = Number(body.count ?? 5);
+      count = Number.isFinite(n) ? Math.min(Math.max(Math.trunc(n), 1), 10) : 5;
+    }
+    const commentaryInput: CommentaryInput = {
+      action: text(body.action, 600),
+      context: text(body.context, 1200),
+      verdict_probs: numericMap(body.verdict_probs),
+      harm: shortHarm(body.harm),
+      crowd: numericMap(body.crowd),
+    };
+
     if (useMock || !apiKey) {
       if (mode === "generate") {
         const rnd = mulberry32(Date.now() % 2147483647);
-        return new Response(
-          JSON.stringify({ cards: mockGenerate(body.theme, Math.min(body.count ?? 5, 10), rnd), source: "mock" }),
-          { headers: { ...corsHeaders, "Content-Type": "application/json" } }
-        );
+        return json({ cards: mockGenerate(theme, count, rnd), source: "mock" });
       }
-      return new Response(JSON.stringify({ commentary: mockCommentary(body), source: "mock" }), {
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
+      return json({ commentary: mockCommentary(commentaryInput), source: "mock" });
     }
 
-    // Non-mock path: check usage cap before any LLM call.
-    const supabase = createClient(
-      Deno.env.get("SUPABASE_URL")!,
-      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
-    );
-    const { data: allowed, error: capErr } = await supabase.rpc("increment_usage", {
-      p_fn: "card-writer",
-      p_cap: DAILY_CAP,
-    });
-    if (capErr || allowed !== true) {
-      return dailyCapResponse();
-    }
+    const supabase = serviceClient();
+    if (!supabase) return notConfigured("SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY");
 
     if (mode === "generate") {
-      const theme = body.theme && THEMES.includes(body.theme) ? body.theme : undefined;
-      const count = Math.min(Math.max(body.count ?? 5, 1), 10);
-      const text = await callLLM([
+      const output = await callLLM(supabase, apiKey, [
         {
           role: "system",
           content:
@@ -176,13 +221,14 @@ Deno.serve(async (req: Request) => {
           content: `Write ${count} new card${count === 1 ? "" : "s"}. Vary the agent roles and industries. Never reuse an example verbatim.`,
         },
       ]);
-      const cards = extractJson(text);
-      if (!Array.isArray(cards)) throw new Error("Expected a JSON array of cards");
+      const cards = extractJson(output);
+      if (!Array.isArray(cards)) throw new UpstreamError("LLM output was not a JSON array of cards");
       const valid = cards
         .filter(
           (c: any) =>
             c && typeof c.agent_role === "string" && typeof c.action === "string" && typeof c.context === "string"
         )
+        .slice(0, count)
         .map((c: any) => ({
           agent_role: String(c.agent_role).slice(0, 200),
           action: String(c.action).slice(0, 500),
@@ -195,14 +241,12 @@ Deno.serve(async (req: Request) => {
         .from("cards")
         .insert(valid)
         .select("*");
-      if (insertErr) throw new Error(insertErr.message);
-      return new Response(JSON.stringify({ cards: saved ?? [], source: "llm" }), {
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
+      if (insertErr) throw new Error(`card insert failed: ${insertErr.message}`);
+      return json({ cards: saved ?? [], source: "llm" });
     }
 
     // commentary mode — the LLM may cite only the numbers we hand it.
-    const text = await callLLM([
+    const output = await callLLM(supabase, apiKey, [
       {
         role: "system",
         content:
@@ -211,23 +255,18 @@ Deno.serve(async (req: Request) => {
       {
         role: "user",
         content: JSON.stringify({
-          action: body.action,
-          context: body.context,
-          jev_verdict_probabilities: body.verdict_probs,
-          jev_harm: body.harm,
-          crowd_split: body.crowd,
+          action: commentaryInput.action,
+          context: commentaryInput.context,
+          jev_verdict_probabilities: commentaryInput.verdict_probs,
+          jev_harm: commentaryInput.harm,
+          crowd_split: commentaryInput.crowd,
           instruction:
             "Write the 2-sentence commentary on the tradeoff. Cite only the numbers above.",
         }),
       },
     ]);
-    return new Response(JSON.stringify({ commentary: text.trim().slice(0, 600), source: "llm" }), {
-      headers: { ...corsHeaders, "Content-Type": "application/json" },
-    });
+    return json({ commentary: output.trim().slice(0, 600), source: "llm" });
   } catch (err) {
-    return new Response(JSON.stringify({ error: err?.message ?? "Internal error" }), {
-      status: 500,
-      headers: { ...corsHeaders, "Content-Type": "application/json" },
-    });
+    return errorResponse(FN, err);
   }
 });

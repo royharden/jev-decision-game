@@ -9,7 +9,9 @@ export async function callFunction<T>(name: string, body: unknown): Promise<T> {
   const res = await fetch(`${url}/functions/v1/${name}`, {
     method: "POST",
     headers: {
+      // Functions run with verify_jwt = true: send the anon key as both bearer and apikey.
       Authorization: `Bearer ${anonKey}`,
+      apikey: anonKey,
       "Content-Type": "application/json",
     },
     body: JSON.stringify(body),
